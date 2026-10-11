@@ -65,6 +65,7 @@ web-sys = { workspace = true, features = [
     "Performance",
     "StorageManager",
     "Url",
+    "UrlSearchParams",
     "Window",
     "Worker",
     "WorkerOptions",

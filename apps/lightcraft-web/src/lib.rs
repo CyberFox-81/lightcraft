@@ -10,6 +10,9 @@
 //!   fall back to the main thread (one job per frame) if workers can't start;
 //! - export downloads the file through the browser.
 //!
+//! `?host=parent` (inside an `<iframe>`) talks to a same-origin parent page: it sends the photo to
+//! edit and stores the exports (`host`).
+//!
 //! `?bench` in the URL runs a scripted first-paint / slider-latency measurement and logs it to the
 //! console (see [`bench`]); `?store=idb` forces the IndexedDB backend, `?store=memory` disables
 //! persistence and `?workers=0` renders on the main thread.
@@ -24,6 +27,8 @@ pub mod wire;
 
 #[cfg(target_arch = "wasm32")]
 mod backend;
+#[cfg(target_arch = "wasm32")]
+mod host;
 #[cfg(target_arch = "wasm32")]
 mod safety;
 #[cfg(target_arch = "wasm32")]

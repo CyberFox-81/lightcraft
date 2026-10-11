@@ -18,6 +18,7 @@ use crate::backend::Backend;
 use crate::backup::{ACTIVE_LIBRARY, DEFAULT_LIBRARY_DIR, valid_library_dir};
 use crate::bench::Bench;
 use crate::files::{Files, FlushOp, LIBRARY_FILES};
+use crate::host::Bridge;
 use crate::safety::{self, notice};
 use crate::store::{Originals, content_hash, download_name, storage_key};
 use crate::wire::ThumbIndex;
@@ -164,7 +165,14 @@ fn download(path: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn services(originals: Originals, backend: Option<Backend>, files: Files, frozen: Rc<Cell<bool>>, ctx: egui::Context) -> Services {
+fn services(
+    originals: Originals,
+    backend: Option<Backend>,
+    files: Files,
+    frozen: Rc<Cell<bool>>,
+    host: Option<Bridge>,
+    ctx: egui::Context,
+) -> Services {
     let (backup_backend, backup_files) = (backend.clone(), files);
     let restore_backend = backend.clone();
     Services {
@@ -221,7 +229,11 @@ fn services(originals: Originals, backend: Option<Backend>, files: Files, frozen
         save_curve_preset_file: None,
         pick_slideshow_templates: None,
         save_slideshow_template: None,
-        write: Some(Box::new(download)),
+        // in a host page (`?host=parent`) exports go to the parent instead of downloading
+        write: Some(match host {
+            Some(host) => Box::new(move |path: &str, bytes: &[u8]| host.post_export(path, bytes)),
+            None => Box::new(download),
+        }),
         // downloads happen on the main thread: exports run in the foreground on the web
         write_shared: None,
         png: Some(Box::new(|img: &lightcraft_raster::Rgba8| {
@@ -382,13 +394,17 @@ struct WebApp {
     frozen: Rc<Cell<bool>>,
     lib_dir: String,
     bench: Option<Bench>,
+    /// The parent page (`?host=parent`), and the content hash of the photo it sent last, to show
+    /// once it is in the library.
+    host: Option<Bridge>,
+    show_from_host: Option<String>,
     first_frame_logged: bool,
     last_save: f64,
     ui_written: Vec<u8>,
 }
 
 impl WebApp {
-    fn new(cc: &eframe::CreationContext<'_>, boot: Boot, chinese_font: Vec<u8>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, boot: Boot, chinese_font: Vec<u8>, host: Option<Bridge>) -> Self {
         let Boot { opts, backend, files, index, lib_dir } = boot;
         let originals = Originals::default();
         let t = perf_now();
@@ -433,8 +449,8 @@ impl WebApp {
         // previews are large (≤ 2560 px, f32): keep few in a 32-bit address space
         session.media.preview_capacity = 3;
         let frozen = Rc::new(Cell::new(false));
-        let mut app = LightcraftApp::new(session, services(originals.clone(), backend.clone(), files.clone(), frozen.clone(), cc.egui_ctx.clone()))
-            .with_chinese_font(chinese_font);
+        let services = services(originals.clone(), backend.clone(), files.clone(), frozen.clone(), host.clone(), cc.egui_ctx.clone());
+        let mut app = LightcraftApp::new(session, services).with_chinese_font(chinese_font);
         let ui_written = files.get("ui.json").unwrap_or_default();
         if let Ok(ui) = serde_json::from_slice::<UiState>(&ui_written) {
             app.ui = ui;
@@ -474,10 +490,44 @@ impl WebApp {
             frozen,
             lib_dir,
             bench: opts.bench.then(|| Bench::new(origin)),
+            host,
+            show_from_host: None,
             first_frame_logged: false,
             last_save: 0.0,
             ui_written,
         }
+    }
+
+    /// Photos the parent page sent: stored and imported like dropped files.
+    fn import_from_host(&mut self, ctx: &egui::Context) {
+        let Some(host) = &self.host else { return };
+        for opened in host.take_opened() {
+            self.show_from_host = Some(content_hash(&opened.bytes));
+            let (originals, backend, ctx) = (self.originals.clone(), self.backend.clone(), ctx.clone());
+            wasm_bindgen_futures::spawn_local(store_file(originals, backend, opened.name, opened.bytes, ctx));
+        }
+    }
+
+    /// Once the photo the parent sent is in the library (imported now, or already there), select
+    /// it and show it with the Edit panel. Then tell the parent whether library changes are still
+    /// waiting for browser storage.
+    fn show_host_photo(&mut self) {
+        let Some(host) = &self.host else { return };
+        if let Some(hash) = &self.show_from_host {
+            let found = self.app.session.catalog.photos().find_map(|p| match &p.source {
+                Source::File { path } if crate::store::hash_of_path(path) == Some(hash.as_str()) => Some(p.id),
+                _ => None,
+            });
+            if let Some(id) = found {
+                self.show_from_host = None;
+                if let Err(e) = self.app.run("library.select", json!({"ids": [id.0]})) {
+                    log::warn!("selecting the opened photo: {e}");
+                }
+                let _ = self.app.run("view.detail", json!({}));
+                self.app.ui.right = lightcraft_ui_egui::state::RightPanel::Edit;
+            }
+        }
+        host.report_pending(self.files.is_dirty() || self.flushing.get());
     }
 
     fn import_dropped(&mut self, ctx: &egui::Context) {
@@ -630,6 +680,7 @@ impl eframe::App for WebApp {
             self.app.ui.toast = Some((text, now + NOTICE_SECS, None));
         }
         self.run_inbox();
+        self.import_from_host(ctx);
         self.import_dropped(ctx);
         self.load_originals(ctx);
         if let Some(w) = &self.workers {
@@ -639,6 +690,7 @@ impl eframe::App for WebApp {
         }
         self.app.logic(ctx);
         self.save();
+        self.show_host_photo();
         if let Some(b) = self.bench.as_mut()
             && let Some(report) = b.step(&mut self.app)
         {
@@ -677,13 +729,18 @@ pub fn start(chinese_font: Vec<u8>) {
         log::warn!("lightcraft: no Simplified Chinese font supplied; Chinese-only glyphs will show as boxes");
     }
     let opts = Options::from_url();
+    // `?host=parent`: a same-origin page framing LightCraft (such as a Nextcloud app) sends the
+    // photo to edit and stores the exports (`host`).
+    let host = if crate::host::requested() { Bridge::new() } else { None };
     wasm_bindgen_futures::spawn_local(async move {
         // one tab per library: two would each keep their own copy and overwrite each other's saves
         if opts.store != "memory" && safety::acquire_tab_lock().await == Some(false) {
-            safety::show_blocking(
-                "LightCraft is already open in another tab or window of this browser.\n\n\
-                 Switch to that tab, or close it and reload this page. (Two tabs would overwrite each other's changes.)",
-            );
+            let text = "LightCraft is already open in another tab or window of this browser.\n\n\
+                 Switch to that tab, or close it and reload this page. (Two tabs would overwrite each other's changes.)";
+            if let Some(host) = &host {
+                host.post_failed(text);
+            }
+            safety::show_blocking(text);
             return;
         }
         let Some(canvas) = window()
@@ -696,7 +753,21 @@ pub fn start(chinese_font: Vec<u8>) {
         };
         let boot = boot(opts).await;
         let runner = eframe::WebRunner::new();
-        let r = runner.start(canvas, eframe::WebOptions::default(), Box::new(move |cc| Ok(Box::new(WebApp::new(cc, boot, chinese_font))))).await;
+        let app_host = host.clone();
+        let r = runner
+            .start(
+                canvas,
+                eframe::WebOptions::default(),
+                Box::new(move |cc| {
+                    let app = WebApp::new(cc, boot, chinese_font, app_host.clone());
+                    if let Some(host) = &app_host {
+                        host.listen(cc.egui_ctx.clone());
+                        host.post_ready();
+                    }
+                    Ok(Box::new(app))
+                }),
+            )
+            .await;
         match r {
             Ok(()) => {
                 if let Some(el) = window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("lightcraft_loading")) {
@@ -704,6 +775,9 @@ pub fn start(chinese_font: Vec<u8>) {
                 }
             }
             Err(e) => {
+                if let Some(host) = &host {
+                    host.post_failed(&format!("{e:?}"));
+                }
                 log::error!("LightCraft failed to start: {e:?}");
                 set_status(&format!("LightCraft failed to start: {e:?}"));
             }

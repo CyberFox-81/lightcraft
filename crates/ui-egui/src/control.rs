@@ -471,11 +471,31 @@ pub const NO_EXPORT_FOLDER: &str = "Choose an export folder first.";
 
 /// Default export folder: `~/Pictures/LightCraft Exports` (`%USERPROFILE%\Pictures\LightCraft Exports`
 /// on Windows, where `HOME` usually isn't set). Empty when no home folder is known.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn default_export_dir() -> String {
     let home = if cfg!(windows) { std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) } else { std::env::var_os("HOME") };
     home.filter(|h| !h.is_empty())
         .map(|h| std::path::PathBuf::from(h).join("Pictures").join("LightCraft Exports").to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static WEB_EXPORT_DIR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Browser: there is no home folder, so no default export folder unless a host page sets one
+/// ([`set_web_export_dir`]).
+#[cfg(target_arch = "wasm32")]
+pub fn default_export_dir() -> String {
+    WEB_EXPORT_DIR.with(|d| d.borrow().clone())
+}
+
+/// Browser: the default export folder, for a host page that stores exports itself (such as a
+/// Nextcloud app, where it is the folder of the photo it opened).
+#[cfg(target_arch = "wasm32")]
+pub fn set_web_export_dir(dir: &str) {
+    WEB_EXPORT_DIR.with(|d| *d.borrow_mut() = dir.to_string());
 }
 
 /// Export the selected photos (UI command `app.export`). Params: see
